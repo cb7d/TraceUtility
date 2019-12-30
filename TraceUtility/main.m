@@ -27,51 +27,35 @@ static void __attribute__((constructor)) hook() {
 
 int main(int argc, const char * argv[]) {
     @autoreleasepool {
-        // Required. Each instrument is a plugin and we have to load them before we can process their data.
+        
         DVTInitializeSharedFrameworks();
         [DVTDeveloperPaths initializeApplicationDirectoryName:@"Instruments"];
         [XRInternalizedSettingsStore configureWithAdditionalURLs:nil];
         [[XRCapabilityRegistry applicationCapabilities]registerCapability:@"com.apple.dt.instruments.track_pinning" versions:NSMakeRange(1, 1)];
         PFTLoadPlugins();
 
-        // Instruments has its own subclass of NSDocumentController without overriding sharedDocumentController method.
-        // We have to call this eagerly to make sure the correct document controller is initialized.
         [PFTDocumentController sharedDocumentController];
 
-        // Open a trace document.
         NSArray<NSString *> *arguments = NSProcessInfo.processInfo.arguments;
         if (arguments.count < 2) {
-            TUPrint(@"Usage: %@ [%@]\n", arguments.firstObject.lastPathComponent, @"trace document");
             return 1;
         }
         NSString *tracePath = arguments[1];
         NSError *error = nil;
         PFTTraceDocument *document = [[PFTTraceDocument alloc]initWithContentsOfURL:[NSURL fileURLWithPath:tracePath] ofType:@"com.apple.instruments.trace" error:&error];
         if (error) {
-            TUPrint(@"Error: %@\n", error);
             return 1;
         }
-        TUPrint(@"Trace: %@\n", tracePath);
-
-        // List some useful metadata of the document.
-        XRDevice *device = document.targetDevice;
-        TUPrint(@"Device: %@ (%@ %@ %@)\n", device.deviceDisplayName, device.productType, device.productVersion, device.buildVersion);
-        PFTProcess *process = document.defaultProcess;
-        TUPrint(@"Process: %@ (%@)\n", process.displayName, process.bundleIdentifier);
-
-        // Each trace document consists of data from several different instruments.
+        
+        NSMutableArray *nodeList = [NSMutableArray arrayWithCapacity:1024 * 64];
         XRTrace *trace = document.trace;
         for (XRInstrument *instrument in trace.allInstrumentsList.allInstruments) {
-            TUPrint(@"\nInstrument: %@ (%@)\n", instrument.type.name, instrument.type.uuid);
-
-            // Each instrument can have multiple runs.
+            
             NSArray<XRRun *> *runs = instrument.allRuns;
             if (runs.count == 0) {
-                TUPrint(@"No data.\n");
                 continue;
             }
             for (XRRun *run in runs) {
-                TUPrint(@"Run #%@: %@\n", @(run.runNumber), run.displayName);
                 instrument.currentRun = run;
 
                 // Common routine to obtain contexts for the instrument.
@@ -90,8 +74,6 @@ int main(int argc, const char * argv[]) {
                     }
                 }
 
-                // Different instruments can have different data structure.
-                // Here are some straightforward example code demonstrating how to process the data from several commonly used instruments.
                 NSString *instrumentID = instrument.type.uuid;
                 if ([instrumentID isEqualToString:@"com.apple.xray.instrument-type.coresampler2"]) {
                     // Time Profiler: print out all functions in descending order of self execution time.
@@ -113,130 +95,15 @@ int main(int argc, const char * argv[]) {
                     NSMutableArray<PFTCallTreeNode *> *nodes = flattenTree(backtraceRepository.rootNode);
                     [nodes sortUsingDescriptors:@[[NSSortDescriptor sortDescriptorWithKey:NSStringFromSelector(@selector(terminals)) ascending:NO]]];
                     for (PFTCallTreeNode *node in nodes) {
-                        TUPrint(@"%@ %@ %i ms\n", node.libraryName, node.symbolName, node.terminals);
-                    }
-                } else if ([instrumentID isEqualToString:@"com.apple.xray.instrument-type.oa"]) {
-                    // Allocations: print out the memory allocated during each second in descending order of the size.
-                    XRObjectAllocInstrument *allocInstrument = (XRObjectAllocInstrument *)instrument;
-                    // 4 contexts: Statistics, Call Trees, Allocations List, Generations.
-                    [allocInstrument._topLevelContexts[2] display];
-                    XRManagedEventArrayController *arrayController = TUIvar(TUIvar(allocInstrument, _objectListController), _ac);
-                    NSMutableDictionary<NSNumber *, NSNumber *> *sizeGroupedByTime = [NSMutableDictionary dictionary];
-                    for (XRObjectAllocEvent *event in arrayController.arrangedObjects) {
-                        NSNumber *time = @(event.timestamp / NSEC_PER_SEC);
-                        NSNumber *size = @(sizeGroupedByTime[time].integerValue + event.size);
-                        sizeGroupedByTime[time] = size;
-                    }
-                    NSArray<NSNumber *> *sortedTime = [sizeGroupedByTime.allKeys sortedArrayUsingComparator:^(NSNumber *time1, NSNumber *time2) {
-                        return [sizeGroupedByTime[time2] compare:sizeGroupedByTime[time1]];
-                    }];
-                    NSByteCountFormatter *byteFormatter = [[NSByteCountFormatter alloc]init];
-                    byteFormatter.countStyle = NSByteCountFormatterCountStyleBinary;
-                    for (NSNumber *time in sortedTime) {
-                        NSString *size = [byteFormatter stringForObjectValue:sizeGroupedByTime[time]];
-                        TUPrint(@"%@ %@\n", time, size);
-                    }
-                } else if ([instrumentID isEqualToString:@"com.apple.dt.coreanimation-fps"]) {
-                    // Core Animation FPS: print out all FPS data samples.
-                    // 2 contexts: Measurements, Statistics
-                    XRContext *context = contexts[0];
-                    [context display];
-                    XRAnalysisCoreTableViewController *controller = TUIvar(context.container, _tabularViewController);
-                    XRAnalysisCorePivotArray *array = controller._currentResponse.content.rows;
-                    XREngineeringTypeFormatter *formatter = TUIvarCast(array.source, _filter, XRAnalysisCoreTableQuery * const).fullTextSearchSpec.formatter;
-                    [array access:^(XRAnalysisCorePivotArrayAccessor *accessor) {
-                        [accessor readRowsStartingAt:0 dimension:0 block:^(XRAnalysisCoreReadCursor *cursor) {
-                            while (XRAnalysisCoreReadCursorNext(cursor)) {
-                                BOOL result = NO;
-                                XRAnalysisCoreValue *object = nil;
-                                result = XRAnalysisCoreReadCursorGetValue(cursor, 0, &object);
-                                NSString *timestamp = result ? [formatter stringForObjectValue:object] : @"";
-                                result = XRAnalysisCoreReadCursorGetValue(cursor, 2, &object);
-                                double fps = result ? [object.objectValue doubleValue] : 0;
-                                result = XRAnalysisCoreReadCursorGetValue(cursor, 3, &object);
-                                double gpu = result ? [object.objectValue doubleValue] : 0;
-                                TUPrint(@"%@ %2.0f FPS %4.1f%% GPU\n", timestamp, fps, gpu);
-                            }
-                        }];
-                    }];
-                } else if ([instrumentID isEqualToString:@"com.apple.dt.network-connections"]) {
-                    // Connections: print out connection history with protocol, addresses and bytes transferred.
-                    // 4 contexts: Summary By Process, Summary By Interface, History, Active Connections
-                    XRContext *context = contexts[2];
-                    [context display];
-                    XRAnalysisCoreTableViewController *controller = TUIvar(context.container, _tabularViewController);
-                    XRAnalysisCorePivotArray *array = controller._currentResponse.content.rows;
-                    XREngineeringTypeFormatter *formatter = TUIvarCast(array.source, _filter, XRAnalysisCoreTableQuery * const).fullTextSearchSpec.formatter;
-                    [array access:^(XRAnalysisCorePivotArrayAccessor *accessor) {
-                        [accessor readRowsStartingAt:0 dimension:0 block:^(XRAnalysisCoreReadCursor *cursor) {
-                            while (XRAnalysisCoreReadCursorNext(cursor)) {
-                                BOOL result = NO;
-                                XRAnalysisCoreValue *object = nil;
-                                result = XRAnalysisCoreReadCursorGetValue(cursor, 4, &object);
-                                NSString *interface = result ? [formatter stringForObjectValue:object] : @"";
-                                result = XRAnalysisCoreReadCursorGetValue(cursor, 5, &object);
-                                NSString *protocol = result ? [formatter stringForObjectValue:object] : @"";
-                                result = XRAnalysisCoreReadCursorGetValue(cursor, 6, &object);
-                                NSString *local = result ? [formatter stringForObjectValue:object] : @"";
-                                result = XRAnalysisCoreReadCursorGetValue(cursor, 7, &object);
-                                NSString *remote = result ? [formatter stringForObjectValue:object] : @"";
-                                result = XRAnalysisCoreReadCursorGetValue(cursor, 10, &object);
-                                NSString *bytesIn = result ? [formatter stringForObjectValue:object] : @"";
-                                result = XRAnalysisCoreReadCursorGetValue(cursor, 12, &object);
-                                NSString *bytesOut = result ? [formatter stringForObjectValue:object] : @"";
-                                TUPrint(@"%@ %@ %@<->%@, %@ in, %@ out\n", interface, protocol, local, remote, bytesIn, bytesOut);
-                            }
-                        }];
-                    }];
-                } else if ([instrumentID isEqualToString:@"com.apple.xray.instrument-type.activity"]) {
-                    // Activity Monitor
-                    XRContext *context = contexts[0];
-                    [context display];
-                    XRAnalysisCoreTableViewController *controller = TUIvar(context.container, _tabularViewController);
-                    XRTime duration = run.timeRange.length;
-                    for (XRTime time = 0; time < duration; time += NSEC_PER_SEC) {
-                        [controller setDocumentInspectionTime:time];
-                        XRAnalysisCorePivotArray *array = controller._currentResponse.content.rows;
-                        XREngineeringTypeFormatter *formatter = TUIvarCast(array.source, _filter, XRAnalysisCoreTableQuery * const).fullTextSearchSpec.formatter;
-                        [array access:^(XRAnalysisCorePivotArrayAccessor *accessor) {
-                            [accessor readRowsStartingAt:0 dimension:0 block:^(XRAnalysisCoreReadCursor *cursor) {
-                                SInt64 columnCount = XRAnalysisCoreReadCursorColumnCount(cursor);
-                                while (XRAnalysisCoreReadCursorNext(cursor)) {
-                                    BOOL result = NO;
-                                    XRAnalysisCoreValue *object = nil;
-                                    NSMutableString *string = [NSMutableString string];
-                                    for (SInt64 column = 0; column < columnCount; column++) {
-                                        result = XRAnalysisCoreReadCursorGetValue(cursor, column, &object);
-                                        [string appendString:result ? [formatter stringForObjectValue:object] : @""];
-                                        [string appendFormat:@", "];
-                                    }
-                                    TUPrint(@"%@", string);
-                                }
-                            }];
-                        }];
-                    }
-                } else if ([instrumentID isEqualToString:@"com.apple.xray.instrument-type.homeleaks"]) {
-
-                    XRLeaksRun *leaksRun = (XRLeaksRun *)run;
-                    for (XRLeak *leak in leaksRun.allLeaks) {
-                        DVT_VMUClassInfo *dvt = TUIvar(leak, _layout);
-                        NSDictionary *parsedLeak = @{
-                            @"name": leak.name != nil ? leak.name : @"",
-                            @"description": dvt != nil && dvt.description ? dvt.description : @"",
-                            @"size": @(leak.size),
-                            @"count": @(leak.count),
-                            @"isCycle": @(leak.inCycle),
-                            @"isRootLeak": @(leak.isRootLeak),
-                            @"allocationTimestamp": @(leak.allocationTimestamp),
-                            @"displayAddress": leak.displayAddress != nil ? leak.displayAddress : @"",
-                            @"debugDescription": dvt != nil && dvt.debugDescription ? dvt.debugDescription : @"",
+//                        TUPrint(@"KSRecord :: %@ %@ %i ms %i total \n", node.libraryName, node.symbolName, node.terminals, node.count);
+                        id obj = @{
+                            @"libraryName": node.libraryName?:@"",
+                            @"symbolName": node.symbolName?:@"",
+                            @"terminals": @(node.terminals)?:@"",
+                            @"count": @(node.count)?:@""
                         };
-                        NSString *name = dvt != nil && dvt.description ? dvt.description : parsedLeak[@"name"];
-                        TUPrint(@"Leaked %@x times: %@", parsedLeak[@"count"], name);
+                        [nodeList addObject:obj];
                     }
-
-                } else {
-                    TUPrint(@"Data processor has not been implemented for this type of instrument.\n");
                 }
 
                 // Common routine to cleanup after done.
@@ -245,6 +112,13 @@ int main(int argc, const char * argv[]) {
                     instrument.viewController = nil;
                 }
             }
+        }
+        
+        if (nodeList.count > 0) {
+            NSError *error;
+            NSData *jsonData = [NSJSONSerialization dataWithJSONObject:nodeList options:NSJSONWritingPrettyPrinted error:&error];
+            NSString *jsonString = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
+            TUPrint(@"%@", jsonString);
         }
 
         // Close the document safely.
